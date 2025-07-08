@@ -1,392 +1,265 @@
-import boto3
-import json
-import base64
-import logging
-from typing import Dict, List, Any, Optional, Union
-from pydantic import BaseModel
-from botocore.exceptions import ClientError, BotoCoreError
-from .base import LLMBase
+"""
+Llama-optimized prompt templates for knowledge graph creation.
+These prompts are specifically tuned for Llama 3 70B model characteristics.
+"""
 
+# Llama-optimized Knowledge Graph Prompt
+LLAMA_KNOWLEDGE_GRAPH_PROMPT = """Analyze the text below and extract entities and relationships to create a knowledge graph.
 
-class BedrockLLM(LLMBase):
-    """AWS Bedrock Llama 70B implementation of the LLMBase abstract class."""
-    
-    def __init__(self, 
-                 region_name: str = "us-east-1",
-                 model_id: str = "meta.llama3-70b-instruct-v1:0",
-                 aws_access_key_id: Optional[str] = None,
-                 aws_secret_access_key: Optional[str] = None,
-                 aws_session_token: Optional[str] = None):
-        """Initialize AWS Bedrock client.
-        
-        Args:
-            region_name: AWS region for Bedrock service
-            model_id: Bedrock model identifier for Llama 70B
-            aws_access_key_id: AWS access key (optional, can use IAM roles)
-            aws_secret_access_key: AWS secret key (optional, can use IAM roles)
-            aws_session_token: AWS session token (optional, for temporary credentials)
-        """
-        self.region_name = region_name
-        self.model_id = model_id
-        
-        # Initialize AWS Bedrock client
-        session_kwargs = {'region_name': region_name}
-        if aws_access_key_id and aws_secret_access_key:
-            session_kwargs.update({
-                'aws_access_key_id': aws_access_key_id,
-                'aws_secret_access_key': aws_secret_access_key
-            })
-            if aws_session_token:
-                session_kwargs['aws_session_token'] = aws_session_token
-        
-        try:
-            session = boto3.Session(**session_kwargs)
-            self.bedrock_client = session.client('bedrock-runtime')
-            logging.info(f"Initialized AWS Bedrock client with model: {model_id} in region: {region_name}")
-        except Exception as e:
-            logging.error(f"Failed to initialize Bedrock client: {e}")
-            raise
-    
-    def _prepare_llama_prompt(self, prompt: str, system_prompt: Optional[str] = None) -> str:
-        """Prepare prompt in Llama 3 chat format.
-        
-        Args:
-            prompt: User prompt
-            system_prompt: Optional system prompt
-            
-        Returns:
-            Formatted prompt for Llama model
-        """
-        if system_prompt:
-            formatted_prompt = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-        else:
-            formatted_prompt = f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-        
-        return formatted_prompt
-    
-    def _invoke_bedrock_model(self, prompt: str, **kwargs) -> str:
-        """Invoke Bedrock model with the given prompt.
-        
-        Args:
-            prompt: The formatted prompt
-            **kwargs: Additional parameters for the model
-            
-        Returns:
-            Generated response text
-        """
-        # Default parameters for Llama 70B
-        default_params = {
-            "max_gen_len": kwargs.get("max_tokens", 2048),
-            "temperature": kwargs.get("temperature", 0.1),
-            "top_p": kwargs.get("top_p", 0.9)
-        }
-        
-        # Update with any provided parameters
-        model_params = {**default_params, **{k: v for k, v in kwargs.items() if k in ['max_gen_len', 'temperature', 'top_p']}}
-        
-        body = {
-            "prompt": prompt,
-            **model_params
-        }
-        
-        try:
-            response = self.bedrock_client.invoke_model(
-                modelId=self.model_id,
-                body=json.dumps(body),
-                contentType="application/json",
-                accept="application/json"
-            )
-            
-            response_body = json.loads(response['body'].read())
-            
-            # Extract the generated text
-            if 'generation' in response_body:
-                return response_body['generation'].strip()
-            else:
-                logging.warning(f"Unexpected response format: {response_body}")
-                return str(response_body)
-                
-        except ClientError as e:
-            logging.error(f"AWS Bedrock API error: {e}")
-            raise
-        except Exception as e:
-            logging.error(f"Error invoking Bedrock model: {e}")
-            raise
-    
-    def generate(self, prompt: str, **kwargs) -> str:
-        """Generate text response from the Llama model."""
-        try:
-            # Format prompt for Llama
-            formatted_prompt = self._prepare_llama_prompt(prompt)
-            
-            # Invoke the model
-            response = self._invoke_bedrock_model(formatted_prompt, **kwargs)
-            
-            logging.info("Successfully generated response from Bedrock Llama model")
-            return response
-            
-        except Exception as e:
-            logging.error(f"Error generating response: {e}")
-            raise
-    
-    def generate_structured(self, prompt: str, response_model: BaseModel, **kwargs) -> BaseModel:
-        """Generate structured response using a Pydantic model.
-        
-        Note: AWS Bedrock doesn't have native structured output like OpenAI,
-        so we'll use prompt engineering to request JSON format.
-        """
-        try:
-            # Create a system prompt that requests JSON format
-            system_prompt = """You are a helpful assistant that always responds with valid JSON matching the requested schema. 
-            Your response must be valid JSON only, with no additional text or explanation."""
-            
-            # Add JSON schema instructions to the prompt
-            schema_prompt = f"""
-            {prompt}
-            
-            Please respond with valid JSON only that matches this structure:
-            {response_model.model_json_schema()}
-            
-            Return only the JSON object, no additional text or explanation.
-            """
-            
-            # Format prompt for Llama
-            formatted_prompt = self._prepare_llama_prompt(schema_prompt, system_prompt)
-            
-            # Generate response
-            response = self._invoke_bedrock_model(formatted_prompt, **kwargs)
-            
-            # Parse and validate the JSON response
-            try:
-                # Try to extract JSON from the response
-                response_json = self._extract_json_from_response(response)
-                return response_model.model_validate(response_json)
-            except Exception as parse_error:
-                logging.warning(f"Failed to parse structured response: {parse_error}")
-                # Fallback: try to create a minimal valid response
-                try:
-                    return response_model()
-                except:
-                    raise ValueError(f"Could not generate valid structured response: {response}")
-                    
-        except Exception as e:
-            logging.error(f"Error generating structured response: {e}")
-            raise
-    
-    def analyze_image(self, image_path: str, prompt: str, **kwargs) -> str:
-        """Analyze an image with a text prompt.
-        
-        Note: Llama 70B is primarily a text model. For image analysis,
-        you might want to use a multimodal model like Claude 3 on Bedrock.
-        This implementation will raise an error suggesting alternatives.
-        """
-        raise NotImplementedError(
-            "Llama 70B model does not support image analysis. "
-            "Consider using a multimodal model like Claude 3 (anthropic.claude-3-sonnet-20240229-v1:0) "
-            "or Claude 3 Haiku (anthropic.claude-3-haiku-20240307-v1:0) on Bedrock for image analysis."
-        )
-    
-    def extract_entities(self, text: str, entity_types: List[str], **kwargs) -> List[Dict[str, Any]]:
-        """Extract named entities from text."""
-        system_prompt = "You are an expert at named entity recognition. Extract entities accurately and return them as valid JSON."
-        
-        prompt = f"""
-        Extract entities of the following types from the given text: {', '.join(entity_types)}
-        
-        Text: {text}
-        
-        Return the entities in JSON format as a list of objects with the following structure:
+TASK:
+Create a JSON knowledge graph with nodes (entities) and relationships.
+
+INPUT TEXT:
+{text}
+
+REQUIREMENTS:
+1. Extract ALL important entities: people, places, organizations, concepts, events, technologies, etc.
+2. Identify relationships between entities
+3. Use clear, descriptive names and types
+4. Create unique IDs using format: type_name (e.g., "person_alice", "company_google")
+
+OUTPUT FORMAT:
+Return ONLY valid JSON in this exact structure:
+
+{{
+    "nodes": [
         {{
-            "entity": "entity_name",
+            "id": "unique_id",
+            "name": "Entity Name",
+            "type": "EntityType",
+            "description": "Brief description"
+        }}
+    ],
+    "relationships": [
+        {{
+            "source": "source_id",
+            "target": "target_id",
+            "type": "relationship_type",
+            "description": "How they are related"
+        }}
+    ]
+}}
+
+ENTITY TYPES TO USE:
+- Person, Organization, Location, Technology, Concept, Event, Product, Process
+
+RELATIONSHIP TYPES TO USE:
+- works_for, located_in, created_by, part_of, leads_to, enables, requires, related_to
+
+IMPORTANT: Return only the JSON object, no additional text or explanation."""
+
+# Llama-optimized Process Flow Prompt
+LLAMA_PROCESS_FLOW_PROMPT = """Analyze the text below and create a process flow graph showing steps, decisions, and workflow.
+
+INPUT TEXT:
+{text}
+
+TASK:
+Extract process steps, decision points, and their sequence to create a workflow graph.
+
+STEP-BY-STEP APPROACH:
+1. Identify all process steps and activities
+2. Find decision points and conditions
+3. Determine the sequence and flow
+4. Identify start and end points
+
+OUTPUT FORMAT:
+Return ONLY valid JSON:
+
+{{
+    "nodes": [
+        {{
+            "id": "step_id",
+            "name": "Step Name",
+            "type": "start|process|decision|end",
+            "description": "What happens in this step"
+        }}
+    ],
+    "relationships": [
+        {{
+            "source": "from_step",
+            "target": "to_step", 
+            "type": "flows_to|leads_to|decides|branches_to",
+            "description": "Condition or trigger"
+        }}
+    ]
+}}
+
+NODE TYPES:
+- start: Beginning of process
+- process: Action or task step  
+- decision: Choice or condition point
+- end: Completion of process
+
+RELATIONSHIP TYPES:
+- flows_to: Normal sequence
+- leads_to: Causal connection
+- decides: Decision outcome
+- branches_to: Alternative path
+
+Return only the JSON, no other text."""
+
+# Llama-optimized Document Analysis Prompt  
+LLAMA_DOCUMENT_ANALYSIS_PROMPT = """Analyze the document content below and create a knowledge graph representing its structure and key concepts.
+
+DOCUMENT CONTENT:
+{text}
+
+OBJECTIVE:
+Extract the document's hierarchical structure, main concepts, and their relationships.
+
+ANALYSIS STEPS:
+1. Identify document sections and hierarchy
+2. Extract key concepts and terms
+3. Find relationships between concepts
+4. Map document structure
+
+OUTPUT FORMAT:
+Return ONLY valid JSON:
+
+{{
+    "nodes": [
+        {{
+            "id": "concept_id",
+            "name": "Concept Name",
+            "type": "document|section|concept|term",
+            "description": "Explanation of the concept"
+        }}
+    ],
+    "relationships": [
+        {{
+            "source": "parent_id",
+            "target": "child_id",
+            "type": "contains|references|defines|relates_to",
+            "description": "Nature of relationship"
+        }}
+    ]
+}}
+
+NODE TYPES:
+- document: Top-level document
+- section: Major sections/chapters
+- concept: Key ideas or topics
+- term: Important definitions
+
+RELATIONSHIP TYPES:
+- contains: Hierarchical containment
+- references: Cross-references
+- defines: Definitions
+- relates_to: Conceptual connections
+
+Return only JSON, no additional text."""
+
+# Llama-optimized General Graph Prompt
+LLAMA_GENERAL_GRAPH_PROMPT = """Create a knowledge graph from the content below by extracting entities and their relationships.
+
+CONTENT:
+{text}
+
+INSTRUCTIONS:
+1. Read and understand the content
+2. Extract important entities (people, places, things, concepts)
+3. Identify how entities are connected
+4. Structure as a graph with nodes and relationships
+
+JSON OUTPUT FORMAT:
+{{
+    "nodes": [
+        {{
+            "id": "entity_id",
+            "name": "Entity Name", 
             "type": "entity_type",
-            "description": "brief description",
-            "properties": {{}}
+            "description": "Brief description"
         }}
-        
-        Return only the JSON array, nothing else.
-        """
-        
-        try:
-            formatted_prompt = self._prepare_llama_prompt(prompt, system_prompt)
-            response = self._invoke_bedrock_model(formatted_prompt, **kwargs)
-            
-            # Extract and parse JSON response
-            try:
-                entities = json.loads(response)
-                if isinstance(entities, list):
-                    return entities
-                elif isinstance(entities, dict) and 'entities' in entities:
-                    return entities['entities']
-                else:
-                    return []
-            except json.JSONDecodeError:
-                # Try to extract JSON from the response
-                extracted_data = self._extract_json_from_response(response)
-                if 'nodes' in extracted_data:
-                    return extracted_data['nodes']
-                return []
-        except Exception as e:
-            logging.error(f"Error extracting entities: {e}")
-            return []
-    
-    def extract_relationships(self, text: str, entities: List[Dict[str, Any]], **kwargs) -> List[Dict[str, Any]]:
-        """Extract relationships between entities."""
-        entity_names = [entity['entity'] for entity in entities]
-        
-        system_prompt = "You are an expert at relationship extraction. Identify relationships between entities accurately and return them as valid JSON."
-        
-        prompt = f"""
-        Given the following entities: {', '.join(entity_names)}
-        
-        Extract relationships between these entities from the text: {text}
-        
-        Return the relationships in JSON format as a list of objects with the following structure:
+    ],
+    "relationships": [
         {{
-            "source": "source_entity",
-            "target": "target_entity",
-            "relationship": "relationship_type",
-            "description": "brief description",
-            "properties": {{}}
+            "source": "entity1_id",
+            "target": "entity2_id",
+            "type": "relationship_type",
+            "description": "How they connect"
         }}
-        
-        Return only the JSON array, nothing else.
-        """
-        
-        try:
-            formatted_prompt = self._prepare_llama_prompt(prompt, system_prompt)
-            response = self._invoke_bedrock_model(formatted_prompt, **kwargs)
-            
-            # Extract and parse JSON response
-            try:
-                relationships = json.loads(response)
-                if isinstance(relationships, list):
-                    return relationships
-                elif isinstance(relationships, dict) and 'relationships' in relationships:
-                    return relationships['relationships']
-                else:
-                    return []
-            except json.JSONDecodeError:
-                # Try to extract JSON from the response
-                extracted_data = self._extract_json_from_response(response)
-                if 'relationships' in extracted_data:
-                    return extracted_data['relationships']
-                return []
-        except Exception as e:
-            logging.error(f"Error extracting relationships: {e}")
-            return []
+    ]
+}}
+
+GUIDELINES:
+- Use clear, unique IDs
+- Choose specific entity types
+- Use descriptive relationship types
+- Include meaningful descriptions
+- Focus on the most important connections
+
+Return only the JSON structure."""
+
+# System prompts optimized for Llama
+LLAMA_SYSTEM_PROMPTS = {
+    "knowledge_graph": """You are an expert knowledge graph analyst. You extract entities and relationships from text with high precision. You always return valid JSON in the exact format requested. You focus on accuracy and completeness.""",
     
-    def summarize(self, text: str, max_length: Optional[int] = None, **kwargs) -> str:
-        """Summarize the input text."""
-        length_instruction = f" in maximum {max_length} words" if max_length else ""
-        system_prompt = "You are an expert at text summarization. Provide clear, concise summaries that capture the key points."
-        
-        prompt = f"Summarize the following text{length_instruction}:\n\n{text}"
-        
-        formatted_prompt = self._prepare_llama_prompt(prompt, system_prompt)
-        return self._invoke_bedrock_model(formatted_prompt, **kwargs)
+    "process_flow": """You are a process analysis expert. You understand workflows, decision points, and process sequences. You create clear process flow graphs that capture the logical flow of activities. You always return valid JSON.""",
     
-    def validate_response(self, response: str, expected_format: str, **kwargs) -> bool:
-        """Validate if the response matches expected format."""
-        system_prompt = "You are an expert validator. Analyze the given response and determine if it matches the expected format."
-        
-        prompt = f"""
-        Validate if the following response matches the expected format: {expected_format}
-        
-        Response: {response}
-        
-        Return only 'true' or 'false'.
-        """
-        
-        try:
-            formatted_prompt = self._prepare_llama_prompt(prompt, system_prompt)
-            validation_result = self._invoke_bedrock_model(formatted_prompt, **kwargs)
-            return validation_result.lower().strip() == 'true'
-        except Exception as e:
-            logging.error(f"Error validating response: {e}")
-            return False
+    "document": """You are a document structure analyst. You understand hierarchical information, concept relationships, and document organization. You create knowledge graphs that represent both structure and content relationships.""",
     
-    def _extract_json_from_response(self, response: str) -> Dict[str, Any]:
-        """Extract JSON from LLM response that might contain extra text."""
-        try:
-            # First, try to parse the response directly
-            return json.loads(response)
-        except json.JSONDecodeError:
-            # If that fails, try to find JSON within the response
-            import re
-            
-            # Look for JSON object starting with { and ending with }
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if json_match:
-                try:
-                    return json.loads(json_match.group())
-                except json.JSONDecodeError:
-                    pass
-            
-            # Look for JSON array starting with [ and ending with ]
-            json_array_match = re.search(r'\[.*\]', response, re.DOTALL)
-            if json_array_match:
-                try:
-                    array_data = json.loads(json_array_match.group())
-                    # If it's an array, wrap it in a nodes structure
-                    return {"nodes": array_data, "relationships": []}
-                except json.JSONDecodeError:
-                    pass
-            
-            # If all else fails, return empty structure
-            logging.warning(f"Could not extract JSON from response: {response[:200]}...")
-            return {"nodes": [], "relationships": []}
+    "general": """You are a knowledge extraction specialist. You identify important entities and their relationships in any type of content. You create well-structured knowledge graphs with clear entity types and meaningful connections."""
+}
+
+# Function to get Llama-optimized prompts
+def get_llama_prompt_template(analysis_type: str = "general") -> str:
+    """
+    Get Llama-optimized prompt template based on analysis type.
     
-    def create_knowledge_graph(self, text: str, prompt_template: str, analysis_type: str = "general", **kwargs) -> Dict[str, Any]:
-        """Create a knowledge graph from text using a prompt template."""
-        try:
-            # Get Llama-optimized system prompt based on analysis type
-            try:
-                from prompt_templates.llama_prompt_templates import get_llama_system_prompt
-                system_prompt = get_llama_system_prompt(analysis_type)
-            except ImportError:
-                # Fallback system prompt
-                system_prompt = """You are an expert knowledge graph creator. Analyze text and extract entities and relationships to create comprehensive knowledge graphs. 
-                Always respond with valid JSON only, containing 'nodes' and 'relationships' arrays."""
-            
-            # The prompt_template should already be formatted, so use it directly
-            formatted_prompt = self._prepare_llama_prompt(prompt_template, system_prompt)
-            
-            response = self._invoke_bedrock_model(formatted_prompt, **kwargs)
-            
-            # Extract and parse JSON response
-            graph_data = self._extract_json_from_response(response)
-            
-            # Ensure the response has the expected structure
-            if not isinstance(graph_data, dict):
-                graph_data = {"nodes": [], "relationships": []}
-            
-            if "nodes" not in graph_data:
-                graph_data["nodes"] = []
-            if "relationships" not in graph_data:
-                graph_data["relationships"] = []
-                
-            return graph_data
-        except Exception as e:
-            logging.error(f"Error creating knowledge graph: {e}")
-            return {"nodes": [], "relationships": []}
+    Args:
+        analysis_type: Type of analysis ('knowledge_graph', 'process_flow', 'document', 'general')
     
-    def analyze_process_image(self, image_path: str, **kwargs) -> Dict[str, Any]:
-        """Analyze a process flow image and extract graph structure.
+    Returns:
+        Llama-optimized prompt template string
+    """
+    llama_templates = {
+        'knowledge_graph': LLAMA_KNOWLEDGE_GRAPH_PROMPT,
+        'process_flow': LLAMA_PROCESS_FLOW_PROMPT,
+        'document': LLAMA_DOCUMENT_ANALYSIS_PROMPT,
+        'general': LLAMA_GENERAL_GRAPH_PROMPT
+    }
+    
+    return llama_templates.get(analysis_type, LLAMA_GENERAL_GRAPH_PROMPT)
+
+def get_llama_system_prompt(analysis_type: str = "general") -> str:
+    """
+    Get Llama-optimized system prompt for the analysis type.
+    
+    Args:
+        analysis_type: Type of analysis
         
-        Note: Llama 70B doesn't support image analysis. This method will raise an error.
-        """
-        raise NotImplementedError(
-            "Llama 70B model does not support image analysis. "
-            "Consider using a multimodal model like Claude 3 on Bedrock for image analysis, "
-            "or use the OpenAI implementation for image processing."
-        )
+    Returns:
+        System prompt optimized for Llama models
+    """
+    return LLAMA_SYSTEM_PROMPTS.get(analysis_type, LLAMA_SYSTEM_PROMPTS["general"])
+
+def format_llama_prompt(text: str, analysis_type: str = "general") -> str:
+    """
+    Format a Llama-optimized prompt template with the given text.
     
-    def get_model_info(self) -> Dict[str, str]:
-        """Get information about the current model."""
-        return {
-            "provider": "AWS Bedrock",
-            "model_id": self.model_id,
-            "region": self.region_name,
-            "capabilities": "Text generation, knowledge graphs, entity extraction, summarization",
-            "limitations": "No image analysis, no native structured output"
-        }
+    Args:
+        text: The text to analyze
+        analysis_type: Type of analysis
+    
+    Returns:
+        Formatted prompt string optimized for Llama
+    """
+    try:
+        template = get_llama_prompt_template(analysis_type)
+        return template.format(text=text)
+    except KeyError as e:
+        print(f"Llama template formatting error: {e}")
+        print(f"Template: {template[:200]}...")
+        raise
+    except Exception as e:
+        print(f"Unexpected Llama formatting error: {e}")
+        print(f"Template: {template[:200]}...")
+        raise
+
+# Comparison prompt for testing both models
+COMPARISON_TEST_PROMPT = """Test prompt for comparing OpenAI vs Llama performance:
+
+Text: "Alice works at Google as a software engineer. She is developing a new AI system called 'SmartAssist' that helps users manage their schedules. The system uses machine learning algorithms to predict user preferences and integrates with calendar applications."
+
+Expected output: Entities for Alice (Person), Google (Organization), SmartAssist (Product), AI system (Technology), machine learning (Technology), calendar applications (Technology). Relationships like works_for, develops, uses, integrates_with."""
