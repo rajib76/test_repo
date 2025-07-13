@@ -3,47 +3,72 @@ from typing import Optional, Dict, List
 from pydantic import BaseModel
 from openai import OpenAI
 
-# ✅ Initialize client using OpenAI SDK v1 (latest)
+# ✅ Initialize OpenAI SDK v1 client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# ✅ Define your Pydantic form
+# ✅ Define the issue form structure
 class IssueModel(BaseModel):
     issue_type: Optional[str]
     device_id: Optional[str]
     severity: Optional[str]
-    description: Optional[str]
+    description: Optional[str]  # This will be rephrased later
 
-# ✅ System prompt defines assistant behavior and schema context
+# ✅ Template for system instructions
 SYSTEM_PROMPT_TEMPLATE = """
-You are a helpful assistant that gathers missing information to fill out a form.
+You are a helpful assistant that gathers missing information to complete a form.
 
-Here are the fields in the form:
+The form includes:
 {schema}
 
-Ask one question at a time to collect the missing information.
-Don't ask about fields that have already been filled.
-Don't repeat yourself.
+Ask one question at a time to get missing information.
+Do not ask about fields already filled.
+Avoid repetition.
 """
 
-# ✅ Utility: format model schema
+# ✅ Template for rephrasing a full issue description
+REPHRASE_PROMPT_TEMPLATE = """
+You are a support documentation assistant.
+
+Based on the following form inputs, write a clear, concise, and professional issue description:
+
+{data}
+
+Make it readable by technical support and help them understand the issue at a glance.
+"""
+
+# ✅ Format utilities
 def get_schema(model: BaseModel) -> str:
     return "\n".join(f"{field}: {type_.__name__}" for field, type_ in model.__annotations__.items())
 
-# ✅ Utility: extract filled values
 def get_known_values(model_data: Dict[str, Optional[str]]) -> str:
     return "\n".join(f"{k}: {v}" for k, v in model_data.items() if v is not None)
 
-# ✅ Utility: get missing fields
 def get_missing_fields(model_data: Dict[str, Optional[str]]) -> List[str]:
     return [k for k, v in model_data.items() if v is None]
 
-# ✅ Main conversation loop
+# ✅ Function to rephrase the issue description
+def generate_rephrased_description(form_data: Dict[str, str]) -> str:
+    prompt = REPHRASE_PROMPT_TEMPLATE.format(
+        data="\n".join(f"{k}: {v}" for k, v in form_data.items())
+    )
+    
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are a helpful support assistant."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.5
+    )
+
+    return response.choices[0].message.content.strip()
+
+# ✅ Main loop
 def main():
-    print("🤖 Let's complete the issue report form.")
+    print("🤖 Let's complete the issue report form.\n")
     
     model_data: Dict[str, Optional[str]] = {field: None for field in IssueModel.__fields__}
 
-    # ✅ Initialize message history
     messages = [
         {
             "role": "system",
@@ -53,16 +78,23 @@ def main():
 
     while True:
         if all(value is not None for value in model_data.values()):
-            print("\n✅ All information has been collected!\n")
+            print("\n✅ All required information has been collected!\n")
             print("📋 Final Completed Form:")
             print("-" * 40)
             for field, value in model_data.items():
                 print(f"{field.title().replace('_', ' ')}: {value}")
             print("-" * 40)
-            print("🎉 Thank you! The form is now complete.")
+
+            # ✅ Create rephrased issue description
+            print("\n📝 Generating professional issue summary using LLM...")
+            rephrased = generate_rephrased_description({k: v for k, v in model_data.items()})
+            print("\n📄 Rephrased Issue Description:")
+            print("-" * 40)
+            print(rephrased)
+            print("-" * 40)
+            print("🎉 Thank you! The issue form is now complete.")
             break
 
-        # ✅ Provide current form state
         user_prompt = f"""
 Current values:
 {get_known_values(model_data) or 'None'}
@@ -73,7 +105,6 @@ Please ask the next best question to fill in the missing data.
 """
         messages.append({"role": "user", "content": user_prompt})
 
-        # ✅ Chat with GPT-4o (OpenAI SDK v1 call)
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=messages,
@@ -87,7 +118,7 @@ Please ask the next best question to fill in the missing data.
         user_input = input("You: ").strip()
         messages.append({"role": "user", "content": user_input})
 
-        # ✅ Assign input to the next missing field
+        # ✅ Assign user input to first missing field
         for field in model_data:
             if model_data[field] is None:
                 model_data[field] = user_input
