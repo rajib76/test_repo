@@ -1,0 +1,85 @@
+from typing import Optional, Dict, List
+from pydantic import BaseModel
+import openai
+import os
+
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# Define the Pydantic model
+class IssueModel(BaseModel):
+    issue_type: Optional[str]
+    device_id: Optional[str]
+    severity: Optional[str]
+    description: Optional[str]
+
+# System prompt: set context
+SYSTEM_PROMPT = """
+You are a helpful assistant that asks intelligent follow-up questions to complete a form. 
+The form has the following fields:
+
+{schema}
+
+Ask one question at a time. Do not repeat questions already asked. Ask only about fields that are not filled yet.
+"""
+
+def is_fully_filled(model: BaseModel) -> bool:
+    return all(getattr(model, field) is not None for field in model.__fields__)
+
+def get_schema(model: BaseModel) -> str:
+    return "\n".join(f"{field}: {field_type}" for field, field_type in model.__annotations__.items())
+
+def get_known_values(model_data: Dict[str, Optional[str]]) -> str:
+    return "\n".join(f"{k}: {v}" for k, v in model_data.items() if v is not None)
+
+def get_missing_fields(model_data: Dict[str, Optional[str]]) -> List[str]:
+    return [k for k, v in model_data.items() if v is None]
+
+def main():
+    print("🤖 Let's complete the issue report.")
+    model_data: Dict[str, Optional[str]] = {field: None for field in IssueModel.__fields__}
+
+    # Start conversation history
+    messages = [{
+        "role": "system",
+        "content": SYSTEM_PROMPT.format(schema=get_schema(IssueModel))
+    }]
+    
+    while True:
+        if all(value is not None for value in model_data.values()):
+            print("\n✅ Completed Form:")
+            print(IssueModel(**model_data).json(indent=2))
+            break
+
+        # Provide context of known values so far
+        user_prompt = f"""
+Here is what we already know:
+{get_known_values(model_data)}
+
+Missing fields: {', '.join(get_missing_fields(model_data))}
+
+Please ask the next best question to fill in the missing data.
+"""
+
+        messages.append({"role": "user", "content": user_prompt})
+
+        response = openai.ChatCompletion.create(
+            model="gpt-4o",
+            messages=messages,
+            temperature=0.6
+        )
+        
+        assistant_message = response.choices[0].message["content"].strip()
+        messages.append({"role": "assistant", "content": assistant_message})
+
+        print("\n🤖", assistant_message)
+        answer = input("You: ").strip()
+        messages.append({"role": "user", "content": answer})
+
+        # Try assigning the answer to the first missing field
+        for field in model_data:
+            if model_data[field] is None:
+                model_data[field] = answer
+                break
+
+if __name__ == "__main__":
+    main()
