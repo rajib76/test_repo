@@ -1,56 +1,60 @@
 import os
 from typing import Optional, Dict, List
 from pydantic import BaseModel
-import openai
 from openai import OpenAI
 
-# Set your OpenAI API key
+# ✅ Initialize client using OpenAI SDK v1 (latest)
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Define the Pydantic model
+# ✅ Define your Pydantic form
 class IssueModel(BaseModel):
     issue_type: Optional[str]
     device_id: Optional[str]
     severity: Optional[str]
     description: Optional[str]
 
-# System prompt: role definition and schema guidance
-SYSTEM_PROMPT = """
-You are a helpful assistant that asks intelligent follow-up questions to complete a form.
-The form has the following fields:
+# ✅ System prompt defines assistant behavior and schema context
+SYSTEM_PROMPT_TEMPLATE = """
+You are a helpful assistant that gathers missing information to fill out a form.
 
+Here are the fields in the form:
 {schema}
 
-Ask one question at a time to get missing information.
-Do not repeat questions already asked or answered.
+Ask one question at a time to collect the missing information.
+Don't ask about fields that have already been filled.
+Don't repeat yourself.
 """
 
+# ✅ Utility: format model schema
 def get_schema(model: BaseModel) -> str:
-    return "\n".join(f"{field}: {field_type}" for field, field_type in model.__annotations__.items())
+    return "\n".join(f"{field}: {type_.__name__}" for field, type_ in model.__annotations__.items())
 
+# ✅ Utility: extract filled values
 def get_known_values(model_data: Dict[str, Optional[str]]) -> str:
     return "\n".join(f"{k}: {v}" for k, v in model_data.items() if v is not None)
 
+# ✅ Utility: get missing fields
 def get_missing_fields(model_data: Dict[str, Optional[str]]) -> List[str]:
     return [k for k, v in model_data.items() if v is None]
 
+# ✅ Main conversation loop
 def main():
-    print("🤖 Let's complete the issue report.")
-
+    print("🤖 Let's complete the issue report form.")
+    
     model_data: Dict[str, Optional[str]] = {field: None for field in IssueModel.__fields__}
 
-    # Start chat history
+    # ✅ Initialize message history
     messages = [
         {
             "role": "system",
-            "content": SYSTEM_PROMPT.format(schema=get_schema(IssueModel))
+            "content": SYSTEM_PROMPT_TEMPLATE.format(schema=get_schema(IssueModel))
         }
     ]
 
     while True:
         if all(value is not None for value in model_data.values()):
-            print("\n✅ All required information has been collected!\n")
-            print("📋 Here's the completed issue report:")
+            print("\n✅ All information has been collected!\n")
+            print("📋 Final Completed Form:")
             print("-" * 40)
             for field, value in model_data.items():
                 print(f"{field.title().replace('_', ' ')}: {value}")
@@ -58,30 +62,32 @@ def main():
             print("🎉 Thank you! The form is now complete.")
             break
 
-        user_context = f"""
-Here is what we already know:
+        # ✅ Provide current form state
+        user_prompt = f"""
+Current values:
 {get_known_values(model_data) or 'None'}
 
 Missing fields: {', '.join(get_missing_fields(model_data))}
 
 Please ask the next best question to fill in the missing data.
 """
-        messages.append({"role": "user", "content": user_context})
+        messages.append({"role": "user", "content": user_prompt})
 
+        # ✅ Chat with GPT-4o (OpenAI SDK v1 call)
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=messages,
             temperature=0.5
         )
 
-        assistant_message = response.choices[0].message.content.strip()
-        messages.append({"role": "assistant", "content": assistant_message})
+        assistant_msg = response.choices[0].message.content.strip()
+        messages.append({"role": "assistant", "content": assistant_msg})
 
-        print("\n🤖", assistant_message)
+        print("\n🤖", assistant_msg)
         user_input = input("You: ").strip()
         messages.append({"role": "user", "content": user_input})
 
-        # Assign answer to the first missing field
+        # ✅ Assign input to the next missing field
         for field in model_data:
             if model_data[field] is None:
                 model_data[field] = user_input
